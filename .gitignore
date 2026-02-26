@@ -1,0 +1,55 @@
+# ========================
+# Python / Backend
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+venv/
+env/
+.venv/
+khoj2/
+
+# Environment Variables
+.env
+.env.local
+
+# Distribution / Builds
+build/
+dist/
+*.egg-info/
+
+# ========================
+# Node.js / Frontend
+# ========================
+node_modules/
+frontend/node_modules/
+
+# Vite/React Build Output
+frontend/dist/
+frontend/build/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ========================
+# Project Specific (Crawler)
+# ========================
+
+crawled_data/
+backend/crawled_data/
+
+
+auth_sessions/
+*.json
+
+# ========================
+# OS & IDE Files
+# ========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
