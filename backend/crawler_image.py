@@ -2,140 +2,130 @@ import os
 import asyncio
 import re
 import hashlib
-import requests
+import time
 from collections import deque
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 from datetime import datetime
 from playwright.async_api import async_playwright
 
 class UniversalImageCrawler:
-    def __init__(self, start_url, max_pages=0, output_dir="crawled_data", websocket=None):
+    def __init__(self, start_url, max_pages=0, output_dir="crawled_data", websocket=None, browser_instance=None):
         self.start_url = start_url
         self.max_pages = int(max_pages)
         self.websocket = websocket
+        self.browser = browser_instance 
         
         parsed = urlparse(start_url)
         self.domain = parsed.netloc
         self.base_url = f"{parsed.scheme}://{parsed.netloc}"
-        
         self.safe_domain = re.sub(r'[^\w]', '_', self.domain)
         self.output_folder = os.path.join(output_dir, self.safe_domain)
         self.images_folder = os.path.join(self.output_folder, "images")
         
-        os.makedirs(self.output_folder, exist_ok=True)
         os.makedirs(self.images_folder, exist_ok=True)
-        
-        self.auth_folder = "auth_sessions"
-        os.makedirs(self.auth_folder, exist_ok=True)
-        
         self.visited = set()
         self.queue = deque([start_url])
-        self.BATCH_SIZE = 6
+        self.BATCH_SIZE = 5 
 
     async def log(self, message, type="info"):
-        print(f"[{type.upper()}] {message}")
         if self.websocket:
-            await self.websocket.send_json({"message": message, "type": type})
-
-    def _get_filename(self, url, title):
-        url_hash = hashlib.md5(url.encode()).hexdigest()[:6]
-        safe_title = re.sub(r'[^\w\-]', '_', title)[:30] or "gallery"
-        return f"{safe_title}_{url_hash}.md"
-
-    def _download_image(self, img_url):
-        try:
-            if not img_url or img_url.startswith("data:"): return None
-            if not img_url.startswith(('http', 'https')):
-                img_url = urljoin(self.base_url, img_url)
-            
-            clean_url = img_url.split('?')[0]
-            ext = os.path.splitext(clean_url)[1]
-            if not ext or len(ext) > 5: ext = ".jpg"
-            
-            img_hash = hashlib.md5(img_url.encode()).hexdigest()[:10]
-            filename = f"img_{img_hash}{ext}"
-            local_path = os.path.join(self.images_folder, filename)
-            rel_path = f"images/{filename}"
-
-            if os.path.exists(local_path): return rel_path
-
-            r = requests.get(img_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5, stream=True)
-            if r.status_code == 200:
-                with open(local_path, 'wb') as f:
-                    for chunk in r.iter_content(1024):
-                        f.write(chunk)
-                return rel_path
-        except:
-            pass
-        return None
+            try: await self.websocket.send_json({"message": message, "type": type})
+            except: pass
 
     async def _process_page(self, context, url):
         page = await context.new_page()
-        # Block fonts/css but Allow Images
-        await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["font", "stylesheet", "media"] else route.continue_())
+        captured_files = []
+
+        # অপ্রয়োজনীয় রিসোর্স ব্লক করা (স্পিড বাড়ানোর জন্য)
+        await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["font", "media", "stylesheet"] else route.continue_())
+
+        async def capture_image(response):
+            if response.request.resource_type == "image":
+                try:
+                    img_url = response.url
+                    if not img_url.startswith("http") or any(x in img_url for x in ["google", "analytics", "ads"]): return
+
+                    buffer = await response.body()
+                    if len(buffer) > 8000: # ৮ কেবি'র নিচের ফাইল বাদ (আইকন ফিল্টার)
+                        file_hash = hashlib.md5(img_url.encode()).hexdigest()[:10]
+                        ext = ".jpg"
+                        if "png" in response.headers.get("content-type", ""): ext = ".png"
+                        elif "webp" in response.headers.get("content-type", ""): ext = ".webp"
+                        
+                        filename = f"img_{file_hash}{ext}"
+                        filepath = os.path.join(self.images_folder, filename)
+
+                        if not os.path.exists(filepath):
+                            with open(filepath, "wb") as f: f.write(buffer)
+                            captured_files.append(f"images/{filename}")
+                except: pass
+
+        page.on("response", capture_image)
 
         try:
-            await page.goto(url, timeout=20000, wait_until="domcontentloaded")
-            for _ in range(3):
-                await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1000)
-            
-            image_urls = await page.evaluate("""() => {
-                const images = Array.from(document.querySelectorAll('img, source'));
-                const urls = new Set();
-                images.forEach(img => {
-                    if (img.srcset) urls.add(img.srcset.split(',').pop().trim().split(' ')[0]);
-                    else if (img.dataset.src) urls.add(img.dataset.src);
-                    else if (img.src) urls.add(img.src);
+            # পেজ লোড টাইম আউট কমিয়ে ৩০ সেকেন্ড করা হয়েছে
+            await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+
+            # ফাস্ট অটো স্ক্রলিং (JS দিয়ে দ্রুত স্ক্রল)
+            await page.evaluate("""async () => {
+                await new Promise(resolve => {
+                    let totalHeight = 0;
+                    let distance = 1000;
+                    let timer = setInterval(() => {
+                        window.scrollBy(0, distance);
+                        totalHeight += distance;
+                        if(totalHeight >= document.body.scrollHeight || totalHeight > 8000){
+                            clearInterval(timer);
+                            resolve();
+                        }
+                    }, 300); // প্রতি ৩০০ মিলিসেকেন্ডে ১০০০ পিক্সেল স্ক্রল
                 });
-                return Array.from(urls);
             }""")
+            
+            await asyncio.sleep(1) # স্ক্রল শেষে জাস্ট ১ সেকেন্ড ওয়েট
 
-            valid_images = []
-            for img in image_urls:
-                if not img.endswith('.svg') and 'icon' not in img:
-                    local_path = self._download_image(img)
-                    if local_path: valid_images.append(local_path)
-
-            if valid_images:
-                title = await page.title()
-                filename = self._get_filename(url, title)
-                filepath = os.path.join(self.output_folder, filename)
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if captured_files:
+                title = (await page.title())[:30]
+                md_filename = f"gallery_{hashlib.md5(url.encode()).hexdigest()[:5]}.md"
+                md_path = os.path.join(self.output_folder, md_filename)
                 
-                content = f"# 📸 Gallery: {title}\n\n> **Source:** [{url}]({url})\n> **Time:** {timestamp}\n> **Images:** {len(valid_images)}\n\n---\n\n"
-                for img_path in valid_images:
+                content = f"# 📸 Captured: {title}\n\nURL: {url}\n\n---\n\n"
+                for img_path in list(set(captured_files)):
                     content += f"![Image]({img_path})\n"
                 
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(content)
-
-                await self.log(f"💾 Saved {len(valid_images)} images: {filename}", "success")
+                with open(md_path, "w", encoding="utf-8") as f: f.write(content)
                 if self.websocket:
-                    await self.websocket.send_json({"type": "file_saved", "domain": self.safe_domain, "filename": filename})
+                    await self.websocket.send_json({"type": "file_saved", "domain": self.safe_domain, "filename": md_filename})
 
-            new_links = []
+            # লিঙ্ক কালেকশন
             links = await page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a => a.href)")
-            for href in links:
-                href = href.split('#')[0].rstrip('/')
-                if href.startswith(self.base_url) and href not in self.visited:
-                        if not href.lower().endswith(('.pdf', '.zip')):
-                            new_links.append(href)
+            new_links = [l.split('#')[0].rstrip('/') for l in links if l.startswith(self.base_url)]
+            
+            await page.close()
             return new_links
 
-        except Exception as e:
-            await self.log(f"Error: {e}", "error")
-            return []
-        finally:
+        except:
             await page.close()
+            return []
 
     async def run(self):
-        await self.log(f"🚀 STARTING IMAGE CRAWLER: {self.start_url}", "success")
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False, args=['--disable-blink-features=AutomationControlled', '--start-maximized'])
-            context = await browser.new_context(viewport={'width':1920,'height':1080})
+        start_time = time.time()
+        await self.log(f"🚀 Speed Image Crawler Started", "success")
+        
+        own_browser = False
+        if not self.browser:
+            playwright = await async_playwright().start()
+            self.browser = await playwright.chromium.launch(headless=True)
+            own_browser = True
+
+        try:
+            context = await self.browser.new_context(
+                viewport={'width': 1280, 'height': 800},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            )
 
             while self.queue and (self.max_pages == 0 or len(self.visited) < self.max_pages):
+                # ব্যাচ প্রসেসিং (একসাথে অনেক লিঙ্ক প্রসেস হবে)
                 batch = []
                 while self.queue and len(batch) < self.BATCH_SIZE:
                     url = self.queue.popleft()
@@ -145,12 +135,17 @@ class UniversalImageCrawler:
                     if self.max_pages > 0 and len(self.visited) >= self.max_pages: break
 
                 if not batch: break
-                await self.log(f"⚡ extracting images from {len(batch)} pages...", "info")
+                
+                await self.log(f"⚡ Processing batch of {len(batch)} pages...", "info")
                 tasks = [self._process_page(context, url) for url in batch]
-                results = await asyncio.gather(*tasks)
+                results = await asyncio.gather(*tasks) # একসাথে সব টাস্ক রান হবে
+                
                 for links in results:
                     for link in links:
-                        if link not in self.visited and link not in self.queue: self.queue.append(link)
+                        if link not in self.visited: self.queue.append(link)
+            
+            await context.close()
+            await self.log(f"🏁 Fast Finish! Time: {round(time.time()-start_time)}s", "success")
 
-            await browser.close()
-            await self.log(f"✅ Image Crawling Done!", "success")
+        finally:
+            if own_browser: await self.browser.close()
